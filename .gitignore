@@ -1,0 +1,29 @@
+cookies*
+config*
+campaign_views.json
+TiktokStreamKeyGenerator.spec
+*.build/*
+*.dist/*
+*.pem
+__pycache__/
+.env
+DevTools/
+*.log
+logs/
+.venv-dev/
+
+# Local captures, reverse-engineering experiments and build outputs
+.venv/
+.venv*/
+Release/
+build/
+artifacts/
+*.chlsj
+logs*/
+nuitka-crash-report.xml
+mediasdk_*.json
+ttv*.json
+/Block List.xml
+/_*.py
+/package.json
+.nuitka-cache/

@@ -1,0 +1,640 @@
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+from curl_cffi import requests
+from Libs.app_paths import read_signer_config
+from Libs.error_reporting import HostedSignerError, SignerFailureKind
+
+try:
+    from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
+except Exception:
+    try:
+        from rapidapi_quota import update_from_headers as _update_quota_headers
+    except Exception:
+        _update_quota_headers = None
+
+try:
+    from Libs.rapidapi_quota import (
+        clear_rate_limit as _clear_rate_limit,
+        note_rate_limited as _note_rate_limited,
+        rate_limit_wait_seconds as _rate_limit_wait_seconds,
+    )
+except Exception:
+    try:
+        from rapidapi_quota import (
+            clear_rate_limit as _clear_rate_limit,
+            note_rate_limited as _note_rate_limited,
+            rate_limit_wait_seconds as _rate_limit_wait_seconds,
+        )
+    except Exception:
+        _clear_rate_limit = None
+        _note_rate_limited = None
+        _rate_limit_wait_seconds = None
+
+try:
+    from Libs.app_paths import logs_dir as _app_logs_dir
+except Exception:
+    try:
+        from app_paths import logs_dir as _app_logs_dir
+    except Exception:
+        _app_logs_dir = None
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
+DEFAULT_RAPIDAPI_HOST = "tiktok-live-studio-api-signer1.p.rapidapi.com"
+FRAME_SIGN_CACHE_SECONDS = 300
+FRAME_SIGN_CACHE_REFRESH_MARGIN_SECONDS = 60
+FRAME_SIGN_BATCH_STEP_SECONDS = 1
+FRAME_SIGN_NEAREST_TOLERANCE_SECONDS = 1
+# How long frame_sign() blocks waiting for an in-flight batch refresh. The
+# refresh itself may take up to FRAME_SIGN_BATCH_TIMEOUT_SECONDS, so giving
+# up earlier kills the proxy while the fetch could still land.
+FRAME_SIGN_PENDING_WAIT_SECONDS = 30
+FRAME_SIGN_BATCH_TIMEOUT_SECONDS = 30
+# A batch fetch is retried on 429/5xx and network errors so a transient
+# RapidAPI rejection does not starve the SEI signature cache mid-stream.
+FRAME_SIGN_BATCH_RETRIES = 2
+FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_CACHE_LOCK = threading.Lock()
+_CACHE = {}
+
+
+def _logs_dir() -> Path:
+    # macOS .app bundles must keep logs/caches outside the bundle; see
+    # app_paths. Falls back to the source-tree logs dir.
+    if _app_logs_dir is not None:
+        try:
+            return Path(_app_logs_dir())
+        except Exception:
+            pass
+    return APP_ROOT / "logs"
+
+
+LOG_PATH = _logs_dir() / "frame_sign_api.log"
+# The batch cache is shared across proxy processes via a disk file so the two
+# listeners of a dual-layout room reuse one set of signatures instead of each
+# paying its own RapidAPI batch calls. Both proxies share the same cache key
+# (aid/uid/did/roomid/frametype); the signature does not cover canvas
+# identity, so the results are interchangeable.
+_CACHE_PATH = _logs_dir() / "frame_sign_cache.json"
+
+
+def _config_value(*names: str) -> str:
+    config = read_signer_config()
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return str(value).strip()
+        value = config.get(name)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _api_base_url() -> str:
+    value = _config_value("signer_api_url", "TIKTOK_SIGNER_API_URL")
+    if not value:
+        value = DEFAULT_RAPIDAPI_URL
+    return value if value.endswith("/") else value + "/"
+
+
+def _rapidapi_key() -> str:
+    return _config_value("rapidapi_key", "RAPIDAPI_KEY")
+
+
+def _log(message: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
+def _json_payload(value):
+    if isinstance(value, (str, bytes)):
+        return json.loads(value.decode("utf-8") if isinstance(value, bytes) else value)
+    return dict(value)
+
+
+def _headers(base_url: str) -> dict:
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    parsed = urlparse(base_url)
+    host = parsed.netloc or DEFAULT_RAPIDAPI_HOST
+    if "rapidapi.com" in host:
+        key = _rapidapi_key()
+        if key:
+            headers["X-RapidAPI-Key"] = key
+        headers["X-RapidAPI-Host"] = host
+    return headers
+
+
+def _retryable_status(status: int) -> bool:
+    # 429 = RapidAPI rate/quota rejection, 5xx = gateway/upstream errors.
+    # Both are frequently transient; one failure must not starve the
+    # signature cache of a live stream.
+    return status == 429 or status >= 500
+
+
+def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0) -> dict:
+    base_url = _api_base_url()
+    attempt = 0
+    while True:
+        # Circuit breaker: while a recent 429 has the plan rate-limited,
+        # fail fast instead of sending requests that are guaranteed to be
+        # rejected (and re-arming the provider's limit window).
+        if _rate_limit_wait_seconds is not None:
+            wait = _rate_limit_wait_seconds()
+            if wait > 0:
+                raise HostedSignerError(
+                    f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s", kind=SignerFailureKind.QUOTA
+                )
+        started = time.perf_counter()
+        response = None
+        network_error = None
+        try:
+            response = requests.post(
+                urljoin(base_url, path.lstrip("/")),
+                headers=_headers(base_url),
+                data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                timeout=timeout,
+                impersonate="chrome",
+            )
+        except requests.exceptions.RequestException as exc:
+            network_error = exc
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if response is not None and _update_quota_headers is not None:
+            try:
+                _update_quota_headers(response.headers)
+            except Exception:
+                pass
+
+        data = None
+        detail = ""
+        if response is None:
+            detail = f"network error: {network_error}"
+        else:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"success": False, "error": response.text[:500]}
+            if isinstance(data, dict):
+                detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+            detail = detail.strip() or response.text[:500].strip()
+
+        status = response.status_code if response is not None else 0
+        if status == 429 and _note_rate_limited is not None:
+            _note_rate_limited()
+        elif response is not None and status < 400 and _clear_rate_limit is not None:
+            _clear_rate_limit()
+        retryable = (response is None or _retryable_status(status)) and attempt < retries
+        # Log the response body on failures: it is the only place RapidAPI
+        # explains why a call was rejected (quota vs subscription vs gateway).
+        log_parts = [
+            f"path={path}",
+            f"status={status if response is not None else 'network'}",
+            f"elapsed_ms={elapsed_ms}",
+        ]
+        if attempt:
+            log_parts.append(f"attempt={attempt + 1}")
+        if detail and (response is None or status >= 400):
+            log_parts.append(f"error={detail[:300]}")
+        elif data is not None:
+            log_parts.append(f"keys={list(data) if isinstance(data, dict) else type(data).__name__}")
+        _log(" ".join(log_parts))
+        if retryable:
+            delay = FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS[
+                min(attempt, len(FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            _log(f"path={path} retry attempt={attempt + 2} in {delay}s")
+            time.sleep(delay)
+            attempt += 1
+            continue
+
+        if response is None:
+            raise HostedSignerError(
+                f"RapidAPI signer request failed after {attempt + 1} attempt(s): {network_error}"
+            ) from network_error
+        if response.status_code >= 400:
+            raise HostedSignerError.from_http(
+                response.status_code, f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+            )
+        if isinstance(data, dict) and data.get("success") is False:
+            raise HostedSignerError(str(data.get("error") or data))
+        return data
+
+
+def _normalize_sign_result(value, template=None) -> dict:
+    if isinstance(value, dict) and isinstance(value.get("signResult"), dict):
+        value = value["signResult"]
+    if not isinstance(value, dict):
+        raise ValueError("frameSign response item is not an object")
+    result = {
+        "frametype": str(value.get("frametype") or (template or {}).get("frametype", "2")),
+        "lid": str(value.get("lid", "1877999593")),
+        "signinfo": str(value.get("signinfo", "")),
+        "signvalue": str(value.get("signvalue", "")),
+        "signversion": str(value.get("signversion", "1.0")),
+    }
+    if not result["signinfo"] or not result["signvalue"]:
+        raise ValueError("frameSign response has blank signinfo/signvalue")
+    return result
+
+
+def _normalize_batch_item(item, template=None):
+    if not isinstance(item, dict):
+        return None
+    raw_ts = item.get("timestamp")
+    if raw_ts is None and isinstance(item.get("signResult"), dict):
+        raw_ts = item["signResult"].get("timestamp")
+    try:
+        timestamp = int(raw_ts)
+    except (TypeError, ValueError):
+        return None
+    out = {
+        "timestamp": timestamp,
+        "signResult": _normalize_sign_result(item, template),
+    }
+    if item.get("startup"):
+        out["startup"] = True
+    return out
+
+
+def _extract_batch_items(data: dict, template=None) -> list[dict]:
+    raw_items = []
+    startup = data.get("startup") if isinstance(data, dict) else None
+    if isinstance(startup, dict):
+        startup = dict(startup)
+        startup["startup"] = True
+        raw_items.append(startup)
+    if isinstance(data, dict):
+        for name in ("signatures", "results", "data"):
+            value = data.get(name)
+            if isinstance(value, list):
+                raw_items.extend(value)
+                break
+    elif isinstance(data, list):
+        raw_items.extend(data)
+
+    items = []
+    for raw in raw_items:
+        try:
+            item = _normalize_batch_item(raw, template)
+        except Exception as exc:
+            _log(f"batch item skipped: {exc}")
+            item = None
+        if item:
+            items.append(item)
+    return items
+
+
+def _should_use_api() -> bool:
+    base_url = _api_base_url()
+    if "rapidapi.com" in urlparse(base_url).netloc:
+        return bool(_rapidapi_key())
+    return bool(base_url)
+
+
+def _payload_timestamp(payload: dict) -> int:
+    try:
+        return int(payload.get("timestamp") or time.time())
+    except (TypeError, ValueError):
+        return int(time.time())
+
+
+def _select_batch_item(items: list[dict], target_timestamp: int) -> dict | None:
+    if not items:
+        return None
+    by_ts = {}
+    for item in items:
+        try:
+            by_ts[int(item["timestamp"])] = item
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not by_ts:
+        return None
+    if target_timestamp in by_ts:
+        return by_ts[target_timestamp]
+    nearest_ts = min(by_ts, key=lambda value: abs(value - target_timestamp))
+    if abs(nearest_ts - target_timestamp) > FRAME_SIGN_NEAREST_TOLERANCE_SECONDS:
+        return None
+    return by_ts[nearest_ts]
+
+
+def _cache_key(payload: dict) -> tuple:
+    return (
+        str(payload.get("aid", "8311")),
+        str(payload.get("uid", "")),
+        str(payload.get("did", payload.get("device_id", ""))),
+        str(payload.get("roomid", payload.get("room_id", ""))),
+        str(payload.get("frametype", "2")),
+    )
+
+
+def _cache_key_str(key: tuple) -> str:
+    return "|".join(key)
+
+
+def _load_disk_cache(key: tuple) -> None:
+    """Merge another process's batch cache into memory, if present and fresh."""
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return
+    entry = data.get(_cache_key_str(key)) or {}
+    items = entry.get("items") or {}
+    until = int(entry.get("until") or 0)
+    now = int(time.time())
+    fresh_items = {}
+    for ts, result in items.items():
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            continue
+        if ts >= now - FRAME_SIGN_CACHE_SECONDS:
+            fresh_items[ts] = result
+    if not fresh_items and not until:
+        return
+    with _CACHE_LOCK:
+        state = _CACHE.setdefault(key, {"items": {}, "until": 0, "refreshing": False})
+        for ts, result in fresh_items.items():
+            state["items"].setdefault(ts, result)
+        state["until"] = max(int(state.get("until", 0)), until)
+
+
+def _persist_cache(key: tuple) -> None:
+    """Write this process's cache entry to the shared disk cache (atomic replace).
+
+    A concurrent writer can lose the other process's merge; the worst case is
+    one extra batch fetch, never a bad signature.
+    """
+    with _CACHE_LOCK:
+        state = _CACHE.get(key) or {}
+        items = dict(state.get("items") or {})
+        until = int(state.get("until") or 0)
+    now = int(time.time())
+    items = {
+        str(ts): result
+        for ts, result in items.items()
+        if int(ts) >= now - 2 * FRAME_SIGN_CACHE_SECONDS
+    }
+    if not items:
+        return
+    existing = {}
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            existing = json.load(fh)
+            if not isinstance(existing, dict):
+                existing = {}
+    except Exception:
+        existing = {}
+    existing[_cache_key_str(key)] = {"items": items, "until": until}
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _CACHE_PATH.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh)
+        os.replace(tmp_path, _CACHE_PATH)
+    except Exception as exc:
+        _log(f"batch-cache persist failed: {exc}")
+
+
+def _store_cache(key: tuple, items: list[dict]) -> int:
+    stored = {}
+    max_ts = 0
+    for item in items:
+        try:
+            timestamp = int(item["timestamp"])
+            result = item["signResult"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not isinstance(result, dict):
+            continue
+        stored[timestamp] = result
+        max_ts = max(max_ts, timestamp)
+
+    with _CACHE_LOCK:
+        current = _CACHE.setdefault(key, {"items": {}, "until": 0, "refreshing": False})
+        current["items"].update(stored)
+        current["until"] = max(int(current.get("until", 0)), max_ts)
+        current["refreshing"] = False
+    _persist_cache(key)
+    return len(stored)
+
+
+def _cached_result(key: tuple, target_timestamp: int) -> dict | None:
+    with _CACHE_LOCK:
+        state = _CACHE.get(key) or {}
+        items = dict(state.get("items") or {})
+
+    if not items:
+        return None
+    if target_timestamp in items:
+        return items[target_timestamp]
+
+    nearest_ts = min(items, key=lambda value: abs(value - target_timestamp))
+    if abs(nearest_ts - target_timestamp) <= FRAME_SIGN_NEAREST_TOLERANCE_SECONDS:
+        return items[nearest_ts]
+    return None
+
+
+def _cache_until(key: tuple) -> int:
+    with _CACHE_LOCK:
+        return int((_CACHE.get(key) or {}).get("until", 0))
+
+
+def _begin_refresh(key: tuple) -> bool:
+    with _CACHE_LOCK:
+        state = _CACHE.setdefault(key, {"items": {}, "until": 0, "refreshing": False})
+        if state.get("refreshing"):
+            return False
+        state["refreshing"] = True
+        return True
+
+
+def _clear_refreshing(key: tuple) -> None:
+    with _CACHE_LOCK:
+        state = _CACHE.setdefault(key, {"items": {}, "until": 0, "refreshing": False})
+        state["refreshing"] = False
+
+
+def _fetch_batch_cache(payload: dict, start_timestamp: int) -> int:
+    key = _cache_key(payload)
+    request_payload = dict(payload)
+    request_payload["timestamp"] = str(int(start_timestamp))
+    data = _post_json(
+        "/framesign/batch",
+        {
+            "payload": request_payload,
+            "start_timestamp": int(start_timestamp),
+            "duration_seconds": FRAME_SIGN_CACHE_SECONDS,
+            "step_seconds": FRAME_SIGN_BATCH_STEP_SECONDS,
+        },
+        timeout=FRAME_SIGN_BATCH_TIMEOUT_SECONDS,
+        retries=FRAME_SIGN_BATCH_RETRIES,
+    )
+    items = _extract_batch_items(data, request_payload)
+    stored = _store_cache(key, items)
+    _log(
+        "batch-cache ok "
+        f"start_ts={int(start_timestamp)} stored={stored} "
+        f"until={_cache_until(key)}"
+    )
+    if not stored:
+        raise HostedSignerError("frameSign batch returned no usable items")
+    return stored
+
+
+def _refresh_cache_background(payload: dict, start_timestamp: int) -> None:
+    key = _cache_key(payload)
+    if not _begin_refresh(key):
+        return
+
+    def refresh():
+        try:
+            _fetch_batch_cache(payload, start_timestamp)
+        except Exception as exc:
+            _clear_refreshing(key)
+            _log(f"batch-cache background failed: {exc}")
+
+    threading.Thread(target=refresh, daemon=True).start()
+
+
+def _frame_sign_from_cache(payload: dict) -> dict:
+    target_timestamp = _payload_timestamp(payload)
+    key = _cache_key(payload)
+
+    result = _cached_result(key, target_timestamp)
+    if result is None:
+        # In-memory miss: another proxy process may already hold a batch for
+        # this same key (dual layout shares one signing identity).
+        _load_disk_cache(key)
+        result = _cached_result(key, target_timestamp)
+        if result is not None:
+            _log(f"batch-cache disk-hit target_ts={target_timestamp} until={_cache_until(key)}")
+    if result is not None:
+        if _cache_until(key) - target_timestamp <= FRAME_SIGN_CACHE_REFRESH_MARGIN_SECONDS:
+            _refresh_cache_background(payload, _cache_until(key) + 1)
+        _log(f"batch-cache hit target_ts={target_timestamp} until={_cache_until(key)}")
+        return result
+
+    if not _begin_refresh(key):
+        deadline = time.time() + FRAME_SIGN_PENDING_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(0.05)
+            result = _cached_result(key, target_timestamp)
+            if result is not None:
+                _log(f"batch-cache waited target_ts={target_timestamp} until={_cache_until(key)}")
+                return result
+        raise TimeoutError(f"frameSign cache refresh is still pending for timestamp={target_timestamp}")
+
+    try:
+        _fetch_batch_cache(payload, target_timestamp)
+    except Exception:
+        _clear_refreshing(key)
+        raise
+
+    result = _cached_result(key, target_timestamp)
+    if result is None:
+        raise ValueError(f"no frameSign cache item near timestamp={target_timestamp}")
+    _log(f"batch-cache miss-filled target_ts={target_timestamp} until={_cache_until(key)}")
+    return result
+
+
+def _frame_sign_from_api(payload: dict) -> dict:
+    data = _post_json("/framesign", {"payload": payload}, timeout=20)
+    try:
+        result = _normalize_sign_result(data, payload)
+    except ValueError as exc:
+        raise HostedSignerError(str(exc)) from exc
+    _log(f"direct ok target_ts={_payload_timestamp(payload)}")
+    return result
+
+
+def frame_sign(input_json, *, implementation='pc', sdk_context=None, **kwargs) -> dict:
+    if implementation not in ('pc', 'mobile'):
+        raise ValueError('implementation must be pc or mobile')
+    if implementation == 'mobile':
+        from Libs.signers import mobile_api_ready
+        mobile_api_ready()
+        if kwargs:
+            raise ValueError('Hosted signing does not accept local entropy options')
+        payload = _json_payload(input_json)
+        data = _post_json('/framesign', {'payload': payload, 'implementation': 'mobile',
+                                       'sdk_context': sdk_context or {}}, timeout=20)
+        try:
+            result = _normalize_sign_result(data, payload)
+        except ValueError as exc:
+            raise HostedSignerError(str(exc)) from exc
+        if str(result.get('signversion')) != '2.0':
+            raise HostedSignerError('Hosted API does not return Android frameSign 2.0 yet.')
+        return result
+    payload = _json_payload(input_json)
+    if kwargs:
+        raise RuntimeError("API frame signing does not accept local signer options")
+    if not _should_use_api():
+        raise HostedSignerError("RapidAPI frame-signing key is required", kind=SignerFailureKind.SUBSCRIPTION)
+    try:
+        return _frame_sign_from_cache(payload)
+    except Exception as exc:
+        _log(f"batch-cache api failed; no local fallback in production mode: {exc}")
+        raise
+
+
+def frame_sign_batch(
+    input_json,
+    *,
+    start_timestamp=None,
+    count=10,
+    step_seconds=30,
+    include_startup=True,
+    **kwargs,
+) -> list[dict]:
+    template = _json_payload(input_json)
+    if start_timestamp is None:
+        start_timestamp = int(time.time())
+    start_timestamp = int(start_timestamp)
+    count = max(1, int(count))
+    step_seconds = max(1, int(step_seconds))
+
+    if kwargs:
+        raise RuntimeError("API frame-signing does not accept local signer options")
+    if not _should_use_api():
+        raise HostedSignerError("RapidAPI frame-signing key is required", kind=SignerFailureKind.SUBSCRIPTION)
+
+    payload = {
+        "payload": template,
+        "start_timestamp": start_timestamp,
+        "count": count,
+        "step_seconds": step_seconds,
+        "include_startup": bool(include_startup),
+    }
+    try:
+        data = _post_json(
+            "/framesign/batch",
+            payload,
+            timeout=FRAME_SIGN_BATCH_TIMEOUT_SECONDS,
+            retries=FRAME_SIGN_BATCH_RETRIES,
+        )
+        items = _extract_batch_items(data, template)
+        if items:
+            _log(f"batch ok requested={count} got={len(items)} first_ts={items[0]['timestamp']} last_ts={items[-1]['timestamp']}")
+            return items
+        raise HostedSignerError(f"no usable batch items in response keys={list(data) if isinstance(data, dict) else type(data).__name__}")
+    except Exception as exc:
+        _log(f"batch api failed; no local fallback in production mode: {exc}")
+        raise
+
+
+class XFrameSign:
+    sign = staticmethod(frame_sign)
+    make = staticmethod(frame_sign)
+    batch = staticmethod(frame_sign_batch)

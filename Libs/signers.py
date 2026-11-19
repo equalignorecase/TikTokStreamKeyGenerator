@@ -1,0 +1,321 @@
+import json
+import os
+import time
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+from curl_cffi import requests
+from Libs.app_paths import read_signer_config
+from Libs.error_reporting import HostedSignerError, SignerFailureKind
+
+try:
+    from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
+except Exception:
+    try:
+        from rapidapi_quota import update_from_headers as _update_quota_headers
+    except Exception:
+        _update_quota_headers = None
+
+try:
+    from Libs.rapidapi_quota import (
+        clear_rate_limit as _clear_rate_limit,
+        note_rate_limited as _note_rate_limited,
+        rate_limit_wait_seconds as _rate_limit_wait_seconds,
+    )
+except Exception:
+    try:
+        from rapidapi_quota import (
+            clear_rate_limit as _clear_rate_limit,
+            note_rate_limited as _note_rate_limited,
+            rate_limit_wait_seconds as _rate_limit_wait_seconds,
+        )
+    except Exception:
+        _clear_rate_limit = None
+        _note_rate_limited = None
+        _rate_limit_wait_seconds = None
+
+try:
+    from Libs.app_paths import logs_dir as _app_logs_dir
+except Exception:
+    try:
+        from app_paths import logs_dir as _app_logs_dir
+    except Exception:
+        _app_logs_dir = None
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
+DEFAULT_RAPIDAPI_HOST = "tiktok-live-studio-api-signer1.p.rapidapi.com"
+
+
+def _logs_dir() -> Path:
+    # macOS .app bundles must keep logs outside the bundle; see app_paths.
+    if _app_logs_dir is not None:
+        try:
+            return Path(_app_logs_dir())
+        except Exception:
+            pass
+    return APP_ROOT / "logs"
+
+
+LOG_PATH = _logs_dir() / "signature_api.log"
+
+
+def _config_value(*names: str) -> str:
+    config = read_signer_config()
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return str(value).strip()
+        value = config.get(name)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _api_base_url() -> str:
+    value = _config_value("signer_api_url", "TIKTOK_SIGNER_API_URL")
+    if not value:
+        value = DEFAULT_RAPIDAPI_URL
+    return value if value.endswith("/") else value + "/"
+
+
+def _rapidapi_key() -> str:
+    return _config_value("rapidapi_key", "RAPIDAPI_KEY")
+
+
+def _log(message: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
+def _headers(base_url: str) -> dict:
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    host = urlparse(base_url).netloc or DEFAULT_RAPIDAPI_HOST
+    if "rapidapi.com" in host:
+        key = _rapidapi_key()
+        if key:
+            headers["X-RapidAPI-Key"] = key
+        headers["X-RapidAPI-Host"] = host
+    return headers
+
+
+def _should_use_api() -> bool:
+    base_url = _api_base_url()
+    if "rapidapi.com" in urlparse(base_url).netloc:
+        return bool(_rapidapi_key())
+    return bool(base_url)
+
+
+def _normalize_headers(value) -> dict[str, str]:
+    if isinstance(value, dict) and isinstance(value.get("headers"), dict):
+        value = value["headers"]
+    if not isinstance(value, dict):
+        raise ValueError("signature API response is not an object")
+    headers = {
+        "x-khronos": _string_header(value.get("x-khronos")),
+        "x-ladon": _string_header(value.get("x-ladon")),
+        "x-argus": _string_header(value.get("x-argus")),
+    }
+    if not headers["x-khronos"] or not headers["x-ladon"] or not headers["x-argus"]:
+        raise ValueError(
+            "signature API response has blank x-khronos/x-ladon/x-argus"
+        )
+    if value.get('x-gorgon'):
+        headers['x-gorgon'] = _string_header(value['x-gorgon'])
+    return headers
+
+
+def mobile_api_ready():
+    """Check client configuration; Android support is checked in signing responses.
+
+    /health is an internal monitoring endpoint, not a subscriber API route.
+    Do not spend a request probing it before real signing operations.
+    """
+    setting = os.environ.get('TIKTOK_MOBILE_API_ENABLED')
+    if setting == '0':
+        raise RuntimeError('Mobile signing is not enabled on the hosted API yet. '
+                           'Use development mode until the API has been updated.')
+    if not _should_use_api():
+        raise HostedSignerError('Configure the signing API key before using Android mode.', kind=SignerFailureKind.SUBSCRIPTION)
+
+
+def _string_header(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _fallback_khronos(timestamp=None) -> str:
+    try:
+        if timestamp is not None:
+            return str(int(timestamp))
+    except (TypeError, ValueError):
+        pass
+    return str(int(time.time()))
+
+
+def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
+    # Circuit breaker: while a recent 429 has the plan rate-limited, fail
+    # fast instead of sending requests that are guaranteed to be rejected.
+    if _rate_limit_wait_seconds is not None:
+        wait = _rate_limit_wait_seconds()
+        if wait > 0:
+            raise HostedSignerError(
+                f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s", kind=SignerFailureKind.QUOTA
+            )
+    base_url = _api_base_url()
+    started = time.perf_counter()
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = _headers(base_url)
+    try:
+        response = requests.post(urljoin(base_url, "signatures"), headers=headers,
+                                 data=body, timeout=timeout, impersonate="chrome")
+    except requests.exceptions.RequestException as exc:
+        raise HostedSignerError(f'Signing service connection failed: {exc}') from exc
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if response.status_code == 429:
+        if _note_rate_limited is not None:
+            _note_rate_limited()
+    elif response.status_code < 400 and _clear_rate_limit is not None:
+        _clear_rate_limit()
+    if _update_quota_headers is not None:
+        try:
+            _update_quota_headers(response.headers)
+        except Exception:
+            pass
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"success": False, "error": response.text[:500]}
+
+    if response.status_code >= 400:
+        detail = ""
+        if isinstance(data, dict):
+            detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+        detail = detail.strip() or response.text[:500].strip()
+        # Log the response body: it is the only place RapidAPI explains why
+        # a call was rejected (quota vs subscription vs gateway).
+        _log(
+            f"path=/signatures status={response.status_code} "
+            f"elapsed_ms={elapsed_ms} error={detail[:300]}"
+        )
+        raise HostedSignerError.from_http(
+            response.status_code, f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+        )
+    if isinstance(data, dict) and data.get("success") is False:
+        raise HostedSignerError(str(data.get("error") or data))
+
+    try:
+        headers = _normalize_headers(data)
+    except ValueError as exc:
+        raise HostedSignerError(str(exc)) from exc
+    _log(
+        "path=/signatures "
+        f"status={response.status_code} elapsed_ms={elapsed_ms} "
+        f"khronos={headers['x-khronos']} "
+        f"ladon_len={len(headers['x-ladon'])} argus_len={len(headers['x-argus'])} "
+        f"params_type={type(payload.get('params')).__name__} "
+        f"stub_len={len(str(payload.get('stub') or ''))} "
+        f"device_id_set={bool(str(payload.get('device_id') or ''))}"
+    )
+    return headers
+
+
+def signature_headers(
+    timestamp,
+    aid="8311",
+    params=None,
+    x_ss_stub=None,
+    device_id=None,
+    local_id=1877999593,
+    *, implementation='pc', url=None, request_headers=None, body_base64=None, install_id=None,
+):
+    if implementation not in ('pc', 'mobile'):
+        raise ValueError('implementation must be pc or mobile')
+    if implementation == 'mobile':
+        mobile_api_ready()
+    khronos = _fallback_khronos(timestamp)
+    if not _should_use_api():
+        _log("missing RapidAPI key; refusing to send blank signature headers")
+        raise HostedSignerError("RapidAPI signer key is required for request signing", kind=SignerFailureKind.SUBSCRIPTION)
+
+    payload = {
+        "timestamp": int(khronos),
+        "aid": str(aid),
+        "device_id": str(device_id or ""),
+        "license_id": int(local_id),
+        "params": params or "",
+        "stub": x_ss_stub or "",
+    }
+    if implementation == 'mobile':
+        payload.update(implementation='mobile', url=url, headers=request_headers or {},
+                       body_base64=body_base64, install_id=str(install_id or ''))
+    try:
+        headers = _post_signatures(payload)
+        if implementation == 'mobile' and not headers.get('x-gorgon'):
+            raise HostedSignerError('Hosted API does not return Android x-gorgon signatures yet.')
+        if not headers["x-khronos"]:
+            headers["x-khronos"] = khronos
+        return headers
+    except Exception as exc:
+        _log(f"signature API failed; refusing to send blank signatures: {exc}")
+        raise
+
+
+def make_ladon(x_khronos: int, local_id: int, aid: str = "8311", **_kwargs):
+    return signature_headers(x_khronos, aid=aid, local_id=local_id)["x-ladon"]
+
+
+def make_x_argus(params=None, stub=None, **kwargs):
+    timestamp = kwargs.get("timestamp")
+    if timestamp is None:
+        timestamp = int(time.time())
+    return signature_headers(
+        timestamp,
+        aid=kwargs.get("aid", "8311"),
+        params=params,
+        x_ss_stub=stub,
+        device_id=kwargs.get("device_id"),
+        local_id=kwargs.get("license_id", kwargs.get("local_id", 1877999593)),
+    )["x-argus"]
+
+
+def build_x_argus(params=None, stub=None, **kwargs):
+    return {
+        "x-argus": make_x_argus(params, stub, **kwargs),
+    }
+
+
+class Ladon:
+    @staticmethod
+    def encrypt(timestamp: int, license_id: int = 1877999593, aid: int | str = "8311") -> str:
+        return make_ladon(timestamp, license_id, str(aid))
+
+
+class XArgus:
+    @staticmethod
+    def make(*args, **kwargs):
+        return make_x_argus(*args, **kwargs)
+
+    @staticmethod
+    def build(*args, **kwargs):
+        return build_x_argus(*args, **kwargs)
+
+    get_sign = make
+
+
+class TikTokSigners:
+    ladon = staticmethod(make_ladon)
+    x_argus = staticmethod(make_x_argus)
+    build_x_argus = staticmethod(build_x_argus)
+    signature_headers = staticmethod(signature_headers)
+
+    Ladon = Ladon
+    XArgus = XArgus

@@ -41,7 +41,8 @@ except Exception:
     curl_exceptions = None
 from packaging import version
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPixmap, QTextCharFormat, QTextCursor
+from qfluentwidgets import isDarkTheme
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -3639,7 +3640,18 @@ class StreamKeyGeneratorWindow(AccentWindow):
             checkbox.toggled.connect(self.update_stream_options_summary)
         self.content_disclosure_combo.currentIndexChanged.connect(self.update_stream_options_summary)
 
-        root_layout.addWidget(input_group, 1)
+        live_left_scroll = ScrollArea(self.live_page)
+        live_left_scroll.setWidgetResizable(True)
+        live_left_scroll.setFrameShape(ScrollArea.NoFrame)
+        live_left_scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }')
+        live_left_panel = QWidget()
+        live_left_panel.setStyleSheet('background: transparent;')
+        live_left_layout = QVBoxLayout(live_left_panel)
+        live_left_layout.setContentsMargins(0, 0, 4, 0)
+        live_left_layout.setSpacing(14)
+        live_left_layout.addWidget(input_group)
+        live_left_scroll.setWidget(live_left_panel)
+        root_layout.addWidget(live_left_scroll, 5)
 
         account_group, account_layout = section("Account")
         account_group.setMinimumWidth(0)
@@ -4113,14 +4125,31 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.save_config_button.setParent(self)
         self.save_config_button.hide()
         account_layout.addStretch(1)
-        root_layout.addWidget(output_group, 1)
+        live_left_layout.addWidget(output_group)
+        live_left_layout.addStretch(1)
+
+        live_right_panel = QWidget()
+        self.live_chat_slot_layout = QVBoxLayout(live_right_panel)
+        self.live_chat_slot_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_chat_slot_layout.setSpacing(12)
+        mini_stats_row = QHBoxLayout()
+        mini_stats_row.setSpacing(12)
+        self.live_viewers_mini_tile = StatTile("Live Viewers", live_right_panel)
+        self.likes_mini_tile = StatTile("Likes", live_right_panel)
+        self.live_viewer_count_output.textChanged.connect(self.live_viewers_mini_tile.setText)
+        self.like_count_output.textChanged.connect(self.likes_mini_tile.setText)
+        mini_stats_row.addWidget(self.live_viewers_mini_tile, 1)
+        mini_stats_row.addWidget(self.likes_mini_tile, 1)
+        self.live_chat_slot_layout.addLayout(mini_stats_row)
+        root_layout.addWidget(live_right_panel, 4)
+
         self.workspace_pages = {'live': self.live_page}
         self.workspace_titles = {'live': 'LIVE', 'chat': 'Chat', 'stats': 'Stats', 'audience': 'Audience', 'safety': 'Safety'}
         self.visible_workspace_views = {'chat', 'stats', 'audience', 'safety'}
         chat_page = QWidget()
-        chat_layout = QVBoxLayout(chat_page)
-        chat_layout.setContentsMargins(0, 0, 0, 0)
-        chat_group, chat_content = section('LIVE chat')
+        self.chat_fullscreen_layout = QVBoxLayout(chat_page)
+        self.chat_fullscreen_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_group, chat_content = section('LIVE chat')
         chat_header = QHBoxLayout()
         self.chat_status = CaptionLabel('Start a LIVE to read chat')
         self.chat_status.setWordWrap(True)
@@ -4142,7 +4171,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.chat_output.setAccessibleName('LIVE chat messages and gifts')
         self.chat_output.setMaximumBlockCount(1000)
         chat_content.addWidget(self.chat_output, 1)
-        chat_layout.addWidget(chat_group)
+        self.live_chat_slot_layout.addWidget(self.chat_group, 1)
         self.workspace_pages['chat'] = chat_page
         for key, card in (('stats', stats_group), ('audience', audience_summary_group), ('safety', safety_group)):
             page = QWidget()
@@ -4402,6 +4431,10 @@ class StreamKeyGeneratorWindow(AccentWindow):
     def show_workspace_view(self, key):
         if key not in self.workspace_pages or (key != 'live' and key not in self.visible_workspace_views):
             return
+        if hasattr(self, 'chat_group'):
+            target_layout = self.chat_fullscreen_layout if key == 'chat' else self.live_chat_slot_layout
+            if self.chat_group.parentWidget() is not target_layout.parentWidget():
+                target_layout.addWidget(self.chat_group, 1)
         changed = self.workspace_stack.currentWidget() is not self.workspace_pages[key]
         self.workspace_stack.setCurrentWidget(self.workspace_pages[key])
         self.workspace_navigation.blockSignals(True)
@@ -6106,9 +6139,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
             return
 
     def sync_activity_spinner(self):
-        self.activity_spinner.setVisible(bool(self._foreground_task or self._game_tags_loading or
-            self.account_info_in_flight or self.device_initialization_in_flight or
-            self.realtime_stats_in_flight or self.audience_safety_in_flight))
+        self.activity_spinner.hide()
 
     def update_stream_controls(self, has_cookies=None):
         busy = self.device_settings_busy()
@@ -6354,9 +6385,12 @@ class StreamKeyGeneratorWindow(AccentWindow):
         scroll = self.chat_output.verticalScrollBar()
         at_bottom = scroll.value() >= scroll.maximum() - 2
         position = scroll.value()
-        lines = []
+        entries = []
         has_comment_or_gift = False
         lang = getattr(self, 'ui_language', 'en')
+        dark = isDarkTheme()
+        join_color = '#8e96a4' if dark else '#6b7280'
+        chat_color = '#60a5fa' if dark else '#2563eb'
         for message in messages:
             if isinstance(message, RoomStatsMessage):
                 if hasattr(self, 'live_viewer_count_output'):
@@ -6383,21 +6417,21 @@ class StreamKeyGeneratorWindow(AccentWindow):
                     self._chat_displayed_gifts[key] = None
                     if len(self._chat_displayed_gifts) > 2000:
                         self._chat_displayed_gifts.popitem(last=False)
-                lines.append(f'[{stamp}] 🎁 {clean_name} {" ".join(message.text.split())}')
+                entries.append((f'[{stamp}] 🎁 {clean_name} {" ".join(message.text.split())}', None))
                 has_comment_or_gift = True
             elif isinstance(message, MemberMessage):
-                lines.append(f'[{stamp}] 👋 {clean_name} {tr("chat.joined", lang)}')
+                entries.append((f'[{stamp}] 👋 {clean_name} {tr("chat.joined", lang)}', join_color))
             elif isinstance(message, SocialMessage):
                 if message.action == 3:
-                    lines.append(f'[{stamp}] 🔁 {clean_name} {tr("chat.shared", lang)}')
+                    entries.append((f'[{stamp}] 🔁 {clean_name} {tr("chat.shared", lang)}', None))
                 else:
-                    lines.append(f'[{stamp}] ➕ {clean_name} {tr("chat.followed", lang)}')
+                    entries.append((f'[{stamp}] ➕ {clean_name} {tr("chat.followed", lang)}', None))
             elif isinstance(message, LikeMessage):
                 if message.total > 0 and hasattr(self, 'like_count_output'):
                     self.like_count_output.setText(f'{message.total:,}')
-                lines.append(f'[{stamp}] ❤️ {clean_name} {tr("chat.liked", lang, count=message.count)}')
+                entries.append((f'[{stamp}] ❤️ {clean_name} {tr("chat.liked", lang, count=message.count)}', None))
             else:
-                lines.append(f'[{stamp}] {clean_name}: {" ".join(message.text.split())}')
+                entries.append((f'[{stamp}] {clean_name}: {" ".join(message.text.split())}', chat_color))
                 has_comment_or_gift = True
             if message.message_id:
                 self._chat_displayed_message_ids[message.message_id] = None
@@ -6408,8 +6442,20 @@ class StreamKeyGeneratorWindow(AccentWindow):
                 self._chat_viewers.move_to_end(str(message.user_id))
                 if len(self._chat_viewers) > 500:
                     self._chat_viewers.popitem(last=False)
-        if lines:
-            self.chat_output.appendPlainText('\n'.join(lines))
+        if entries:
+            cursor = self.chat_output.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            needs_newline = self.chat_output.document().characterCount() > 1 or bool(self.chat_output.toPlainText())
+            for line, color_hex in entries:
+                fmt = QTextCharFormat()
+                if color_hex:
+                    fmt.setForeground(QColor(color_hex))
+                else:
+                    fmt.setForeground(self.chat_output.palette().text())
+                if needs_newline:
+                    cursor.insertText('\n', fmt)
+                cursor.insertText(line, fmt)
+                needs_newline = True
             scroll.setValue(scroll.maximum() if at_bottom else position)
             self.chat_status.setText('Connected')
             if has_comment_or_gift and self.chat_sound_checkbox.isChecked():

@@ -1,5 +1,5 @@
 """Shared Fluent controls for the existing PySide6 application."""
-from PySide6.QtCore import QObject, Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPalette
 from PySide6.QtWidgets import QApplication, QDialog as QtDialog, QLabel, QGridLayout, QVBoxLayout, QWidget, QSizePolicy, QToolTip, QMessageBox as QtMessageBox
 from qfluentwidgets import (
@@ -267,6 +267,8 @@ class MinimalCard(CardWidget):
 
 class StatTile(QWidget):
     """Minimal KPI stat tile with .setText() / .text() compatibility."""
+    textChanged = Signal(str)
+
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
         self._raw_text = ""
@@ -291,6 +293,7 @@ class StatTile(QWidget):
         self._raw_text = "" if value is None else str(value)
         display = self._raw_text.strip() or "—"
         self.value_label.setText(display)
+        self.textChanged.emit(self._raw_text)
 
     def text(self) -> str:
         return self._raw_text

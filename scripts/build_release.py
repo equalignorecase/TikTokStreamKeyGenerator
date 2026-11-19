@@ -53,7 +53,7 @@ def nuitka_command(version, build_type, system=None):
             '--include-data-files=assets/app-icon.png=assets/app-icon.png']
     if system == 'Windows':
         args += ['--clang', '--windows-icon-from-ico=assets/app-icon.ico',
-                 '--company-name=Loukious', '--product-name=TikTok Stream Key Generator',
+                 '--company-name=equalignorecase', '--product-name=TikTok Stream Key Generator',
                  f'--file-version={version}', f'--product-version={version}',
                  '--file-description=TikTok Stream Key Generator']
         if build_type == 'Release':

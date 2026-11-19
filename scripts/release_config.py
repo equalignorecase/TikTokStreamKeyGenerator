@@ -2,7 +2,7 @@
 from scripts.build_release import validate_version
 
 
-PUBLIC_REPOSITORY = 'Loukious/TikTokStreamKeyGenerator'
+PUBLIC_REPOSITORY = 'equalignorecase/TikTokStreamKeyGenerator'
 RELEASE_SIGNING_POLICY = 'release-signing'
 RELEASE_CERTIFICATE = 'release_certificate_2026'
 

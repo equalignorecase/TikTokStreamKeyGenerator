@@ -215,7 +215,7 @@ jobs:
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
   release:
-    if: inputs.publish && github.repository == 'Loukious/TikTokStreamKeyGenerator'
+    if: inputs.publish && github.repository == 'equalignorecase/TikTokStreamKeyGenerator'
     runs-on: ubuntu-24.04
     needs: [validate, test, build]
     permissions:
